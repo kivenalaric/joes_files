@@ -16,7 +16,7 @@
 
     const FRYE_LOCATION_ID = "oUKKuxKyYWHUoncYOKhr";
 
-    // ── Helpers ──
+    // ── Helpers ──`
 
     function getLocationId() {
         const match = window.location.href.match(/\/location\/([^/]+)/);
