@@ -3,11 +3,12 @@
 
     var FRYE_LOCATION_ID = "oUKKuxKyYWHUoncYOKhr";
     var fryeConsultInterval;
-    var FRYE_PDF_URL = "https://raw.githubusercontent.com/kivenalaric/joes_files/main/Frye%20Doc.pdf";
+    var FRYE_PDF_URL = "https://raw.githubusercontent.com/kivenalaric/joes_files/main/Clean%20Consultation%20Doc.pdf";
+    var GHL_API = "https://services.leadconnectorhq.com";
 
     console.log("FRYE CONSULTATION SCRIPT LOADED");
 
-    // Load pdf-lib via fetch + eval
+    // ── pdf-lib loading ──
     var pdfLibLoaded = false;
     function loadPdfLib() {
         var urls = [
@@ -17,57 +18,278 @@
         ];
         function tryLoad(idx) {
             if (idx >= urls.length) { console.error("Frye Consult: ALL pdf-lib sources failed"); return; }
-            console.log("Frye Consult: Fetching pdf-lib from", urls[idx]);
             fetch(urls[idx]).then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
             .then(function(code) { var fn = new Function(code); fn(); if (window.PDFLib) { pdfLibLoaded = true; console.log("Frye Consult: pdf-lib loaded!"); } else { throw new Error("not on window"); } })
-            .catch(function(err) { console.error("Frye Consult: FAILED from", urls[idx], err.message); tryLoad(idx + 1); });
+            .catch(function(err) { console.error("Frye Consult: pdf-lib FAILED from", urls[idx], err.message); tryLoad(idx + 1); });
         }
         tryLoad(0);
     }
     loadPdfLib();
 
-    // Cache the template PDF bytes so we only fetch once
+    // ── Template caching ──
     var cachedTemplateBytes = null;
     function fetchTemplate() {
         if (cachedTemplateBytes) return Promise.resolve(cachedTemplateBytes);
-        console.log("Frye Consult: Fetching PDF template from GitHub...");
         return fetch(FRYE_PDF_URL).then(function(r) {
             if (!r.ok) throw new Error("Template fetch failed: " + r.status);
             return r.arrayBuffer();
         }).then(function(buf) {
             cachedTemplateBytes = new Uint8Array(buf);
-            console.log("Frye Consult: PDF template loaded!", cachedTemplateBytes.length, "bytes");
+            console.log("Frye Consult: Template loaded,", cachedTemplateBytes.length, "bytes");
             return cachedTemplateBytes;
         });
     }
 
-    // Start scanning
+    // ── Auth token from IndexedDB (Firebase) ──
+    function getAuthToken() {
+        return new Promise(function(resolve, reject) {
+            var req = indexedDB.open("firebaseLocalStorageDb");
+            req.onerror = function() { reject(new Error("Cannot open IndexedDB")); };
+            req.onsuccess = function(e) {
+                var db = e.target.result;
+                var tx = db.transaction("firebaseLocalStorage", "readonly");
+                var store = tx.objectStore("firebaseLocalStorage");
+                var getReq = store.getAll();
+                getReq.onsuccess = function() {
+                    for (var i = 0; i < getReq.result.length; i++) {
+                        var item = getReq.result[i];
+                        if (item.value && item.value.stsTokenManager && item.value.stsTokenManager.accessToken) {
+                            resolve(item.value.stsTokenManager.accessToken);
+                            return;
+                        }
+                    }
+                    reject(new Error("No auth token in IndexedDB"));
+                };
+                getReq.onerror = function() { reject(new Error("IndexedDB read failed")); };
+            };
+        });
+    }
+
+    // ── GHL API helpers ──
+    function ghlFetch(path, token) {
+        return fetch(GHL_API + path, {
+            headers: { "Authorization": "Bearer " + token, "Version": "2021-07-28" }
+        }).then(function(r) {
+            if (!r.ok) throw new Error("GHL API " + path + ": " + r.status);
+            return r.json();
+        });
+    }
+
+    var cachedFieldDefs = null;
+    function fetchFieldDefs(token) {
+        if (cachedFieldDefs) return Promise.resolve(cachedFieldDefs);
+        return ghlFetch("/locations/" + FRYE_LOCATION_ID + "/customFields", token)
+        .then(function(data) {
+            var map = {};
+            var arr = data.customFields || data || [];
+            if (Array.isArray(arr)) {
+                for (var i = 0; i < arr.length; i++) map[arr[i].id] = (arr[i].name || arr[i].fieldKey || "").trim();
+            }
+            cachedFieldDefs = map;
+            console.log("Frye Consult: Field defs loaded", Object.keys(map).length, "fields");
+            return map;
+        }).catch(function(err) {
+            console.warn("Frye Consult: Field defs failed, custom fields will use IDs", err.message);
+            cachedFieldDefs = {};
+            return {};
+        });
+    }
+
+    var cachedUsers = {};
+    function fetchUserName(userId, token) {
+        if (!userId) return Promise.resolve("");
+        if (cachedUsers[userId]) return Promise.resolve(cachedUsers[userId]);
+        return ghlFetch("/users/" + userId, token).then(function(data) {
+            var name = ((data.name || data.firstName || "") + " " + (data.lastName || "")).trim();
+            cachedUsers[userId] = name;
+            return name;
+        }).catch(function() { return ""; });
+    }
+
+    // ── Extract opportunity ID from pipeline card ──
+    function getCardOpportunityId(el) {
+        var node = el.closest(".ui-card") || el;
+        while (node && node !== document.body) {
+            var keys = Object.getOwnPropertyNames(node);
+            for (var i = 0; i < keys.length; i++) {
+                if (keys[i].indexOf("__vue") === -1 && keys[i].indexOf("__vnode") === -1) continue;
+                try {
+                    var v = node[keys[i]];
+                    if (!v) continue;
+                    // Vue 3 component instance
+                    if (v.ctx) {
+                        if (v.ctx.opportunity && v.ctx.opportunity.id) return v.ctx.opportunity.id;
+                        if (v.ctx.card && v.ctx.card.id) return v.ctx.card.id;
+                    }
+                    if (v.props) {
+                        if (v.props.opportunity && v.props.opportunity.id) return v.props.opportunity.id;
+                        if (v.props.card && v.props.card.id) return v.props.card.id;
+                        if (v.props.opportunityId) return v.props.opportunityId;
+                    }
+                    // Vue 2
+                    if (v.$data) {
+                        if (v.$data.opportunity && v.$data.opportunity.id) return v.$data.opportunity.id;
+                        if (v.$data.card && v.$data.card.id) return v.$data.card.id;
+                    }
+                    if (v.$props) {
+                        if (v.$props.opportunity && v.$props.opportunity.id) return v.$props.opportunity.id;
+                        if (v.$props.card && v.$props.card.id) return v.$props.card.id;
+                    }
+                } catch(e) {}
+            }
+            node = node.parentElement;
+        }
+        // Fallback: try URL
+        var m = window.location.href.match(/opportunity_id=([^&]+)/);
+        return m ? m[1] : null;
+    }
+
+    // ── Map API response → PDF fields ──
+    function mapApiToFields(opp, fieldDefs, ownerName) {
+        var d = {};
+        var contact = opp.contact || {};
+
+        // Build label→value map from custom fields
+        var cfByLabel = {};
+        var customFields = opp.customFields || [];
+        for (var i = 0; i < customFields.length; i++) {
+            var label = (fieldDefs[customFields[i].id] || "").toLowerCase().trim();
+            var val = customFields[i].fieldValue || "";
+            if (label) cfByLabel[label] = val;
+        }
+        console.log("Frye Consult: Custom field values by label", cfByLabel);
+
+        function cf(/* label variants */) {
+            for (var i = 0; i < arguments.length; i++) {
+                var key = arguments[i].toLowerCase().trim();
+                if (cfByLabel[key]) return cfByLabel[key];
+            }
+            return "";
+        }
+
+        // Auto-generated
+        var now = new Date();
+        d.date = (now.getMonth() + 1) + "/" + now.getDate() + "/" + now.getFullYear();
+        var hrs = now.getHours(), mins = now.getMinutes(), ampm = hrs >= 12 ? "PM" : "AM";
+        hrs = hrs % 12; if (hrs === 0) hrs = 12;
+        d.time = hrs + ":" + (mins < 10 ? "0" : "") + mins + " " + ampm;
+
+        d.charges = opp.name || "";
+        d.intaker = ownerName || "";
+        d.scheduledBy = "";
+        d.staff = "";
+        d.legalStatus = "";
+        d.calendarFeePaid = "";
+        d.reasonWaived = "";
+
+        d.consultStatus = cf("consult status");
+        d.consultType = cf("consult type");
+        d.matterQualified = cf("matter qualified");
+        d.reasonNotQualified = cf("reason not qualified");
+
+        // PNC Info — Criminal Defense Intake
+        d.pncName = cf("pnc is currently represented by", "pnc name", "contact name") || contact.name || "";
+
+        // Opportunity Details
+        d.dob = cf("dob", "date of birth");
+        d.phone = cf("primary phone", "phone") || contact.phone || "";
+        d.email = cf("primary email", "email") || contact.email || "";
+        d.mailingAddress = cf("mailing address", "address");
+
+        // Criminal Defense Intake
+        d.militaryStatus = cf("military?", "military status", "military");
+        d.doi = cf("date of incident", "doi");
+        d.doa = cf("date of arrest", "doa");
+        d.court = cf("court");
+        d.county = cf("county/jurisdiction (criminal defense)", "county/jurisdiction", "county");
+        d.incidentNotes = cf("incident notes", "other notes");
+        d.involvedParties = cf("involved parties");
+        d.priors = cf("prior criminal record", "prior charges/arrests", "priors");
+        d.employer = cf("client employer/employment", "employer/employment", "employer");
+        d.employmentImpact = cf("employment impact");
+        d.medicalDiagnosis = cf("medical diagnosis/meds", "medical diagnosis");
+
+        // Attorney / Outcomes
+        d.attorneyNotes = cf("attorney notes");
+        d.desiredOutcome = cf("desired outcome");
+        d.biggestConcerns = cf("biggest concerns");
+        d.todoIfRetained = cf("to do if retained");
+        d.assignTo = cf("assign to", "assigned to");
+
+        // Emergency Contact
+        d.emergencyContact = cf("additional contact phone", "emergency contact");
+        d.relationshipToPNC = cf("relation to pnc", "relationship to pnc");
+        d.emergencyPhone = cf("emergency contact phone");
+        d.emergencyEmail = cf("emergency contact email");
+
+        // Payment
+        d.retainerOnly = cf("retainer only");
+        d.retainerPlusTrial = cf("retainer + trial");
+        d.singlePaymentRetainer = cf("single payment retainer");
+        d.paymentPlan = cf("payment plan");
+        d.noRetainerReferTo = cf("no retainer; reject or refer to", "reject or refer to");
+        d.other = cf("other");
+        d.dueAtSigning = cf("due at signing");
+        d.numInstallments = cf("number of installments", "# of installments");
+        d.dueDate = cf("due date", "installment due day");
+        d.startDate = cf("start date", "installment start month");
+        d.cashDiscount = cf("cash discount");
+        d.cashDiscountPaidBy = cf("cash discount paid by", "if paid by");
+        d.courtesyDiscount = cf("courtesy discount");
+        d.courtesyNotes = cf("courtesy discount notes");
+
+        return d;
+    }
+
+    // ── Main generate function ──
+    function generatePDF(opportunityId) {
+        if (!pdfLibLoaded || !window.PDFLib) { alert("PDF library still loading. Please wait."); return Promise.resolve(); }
+        console.log("Frye Consult: Generating for opportunity", opportunityId);
+
+        return getAuthToken().then(function(token) {
+            return Promise.all([
+                ghlFetch("/opportunities/" + opportunityId, token),
+                fetchFieldDefs(token),
+                token
+            ]);
+        }).then(function(results) {
+            var oppData = results[0].opportunity || results[0];
+            var fieldDefs = results[1];
+            var token = results[2];
+            return fetchUserName(oppData.assignedTo, token).then(function(ownerName) {
+                return mapApiToFields(oppData, fieldDefs, ownerName);
+            });
+        }).then(function(data) {
+            console.log("Frye Consult: Mapped fields", data);
+            return fetchTemplate().then(function(tpl) { fillTemplate(data, tpl); });
+        }).catch(function(err) {
+            console.error("Frye Consult: Generate error:", err);
+            alert("Error generating PDF: " + err.message + "\nCheck console for details.");
+        });
+    }
+
+    // ── Scanning ──
     window.addEventListener("routeChangeEvent", function (eev) {
-        console.log("Frye Consult: Route changed", eev && eev.detail && eev.detail.to && eev.detail.to.name);
         clearInterval(fryeConsultInterval);
         if (eev && eev.detail && eev.detail.to && eev.detail.to.params && eev.detail.to.params.location_id == FRYE_LOCATION_ID) {
             startScanning();
         }
     });
-
-    if (window.location.href.indexOf(FRYE_LOCATION_ID) > -1) {
-        console.log("Frye Consult: Already on Frye location, starting scan");
-        startScanning();
-    }
+    if (window.location.href.indexOf(FRYE_LOCATION_ID) > -1) startScanning();
 
     function startScanning() {
         clearInterval(fryeConsultInterval);
         fryeConsultInterval = setInterval(function () { scanCards(); scanModal(); }, 500);
     }
 
+    // ── Card button (generates without opening modal) ──
     function scanCards() {
         var cards = document.querySelectorAll(".ui-card .ui-card-content [data-contact-id]");
-        if (cards.length === 0) return;
+        if (!cards.length) return;
         cards.forEach(function (element) {
             var parenDiv = element.parentElement;
             if (!parenDiv || parenDiv.classList.contains("frye_consult_added")) return;
             parenDiv.classList.add("frye_consult_added");
-            console.log("Frye Consult: Adding icon to card");
             addConsultBtn(parenDiv);
         });
     }
@@ -76,282 +298,52 @@
         var btn = document.createElement("div");
         btn.classList.add("frye_consult_btn");
         btn.style.cssText = "position:relative;cursor:pointer;";
-        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="#1D2567" viewBox="0 0 16 16"><path d="M9.293 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.707A1 1 0 0 0 13.707 4L10 .293A1 1 0 0 0 9.293 0zM9.5 3.5v-2l3 3h-2a1 1 0 0 1-1-1zM4.5 9a.5.5 0 0 1 0-1h7a.5.5 0 0 1 0 1h-7zM4 10.5a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zm.5 2.5a.5.5 0 0 1 0-1h4a.5.5 0 0 1 0 1h-4z"/></svg>';
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="#165def" viewBox="0 0 16 16"><path d="M9.293 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V4.707A1 1 0 0 0 13.707 4L10 .293A1 1 0 0 0 9.293 0zM9.5 3.5v-2l3 3h-2a1 1 0 0 1-1-1zM4.5 9a.5.5 0 0 1 0-1h7a.5.5 0 0 1 0 1h-7zM4 10.5a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 0 1h-7a.5.5 0 0 1-.5-.5zm.5 2.5a.5.5 0 0 1 0-1h4a.5.5 0 0 1 0 1h-4z"/></svg>';
         if (parenDiv.children[2]) { parenDiv.children[2].appendChild(btn); } else { parenDiv.appendChild(btn); }
         btn.addEventListener("click", function (e) {
             e.stopPropagation(); e.preventDefault();
-            var el = parenDiv.querySelector("[data-contact-id]");
-            if (el) el.click();
-            var attempts = 0;
-            var wi = setInterval(function () {
-                attempts++;
-                var fi = document.querySelectorAll(".hr-form-item");
-                if (fi.length > 3 || attempts > 40) {
-                    clearInterval(wi);
-                    if (fi.length < 3) { console.error("Frye Consult: Form fields did not load"); return; }
-                    setTimeout(function () { doGeneratePDF(); }, 500);
-                }
-            }, 500);
+            var oppId = getCardOpportunityId(parenDiv);
+            if (!oppId) {
+                console.error("Frye Consult: Could not extract opportunity ID from card");
+                alert("Could not find opportunity ID. Try opening the card and using the button there.");
+                return;
+            }
+            console.log("Frye Consult: Card button → oppId:", oppId);
+            generatePDF(oppId);
         });
     }
 
+    // ── Modal button (backup — works when card is already open) ──
     function scanModal() {
         if (document.querySelector(".frye-consult-pdf-btn")) return;
         var titleEl = document.querySelector(".ui-modal-heading .title");
         if (!titleEl) return;
-        console.log("Frye Consult: Modal detected, adding button");
         var btn = document.createElement("button");
         btn.textContent = "Consultation PDF";
         btn.className = "frye-consult-pdf-btn";
-        btn.style.cssText = "border:1px solid grey;background:#1D2567;color:white;border-radius:5px;padding:2px 10px;margin-left:8px;cursor:pointer;font-size:12px;vertical-align:middle;";
+        btn.style.cssText = "border:1px solid grey;background:#165def;color:white;border-radius:5px;padding:2px 10px;margin-left:8px;cursor:pointer;font-size:12px;vertical-align:middle;";
         btn.addEventListener("click", function (e) {
             e.stopPropagation(); e.preventDefault();
+            // Try URL first, then Vue internals on modal
+            var oppId = null;
+            var m = window.location.href.match(/opportunity_id=([^&]+)/);
+            if (m) oppId = m[1];
+            if (!oppId) {
+                var modal = document.querySelector(".ui-modal, .hl-modal");
+                if (modal) oppId = getCardOpportunityId(modal);
+            }
+            if (!oppId) { alert("Could not find opportunity ID."); return; }
             btn.textContent = "Generating..."; btn.disabled = true;
-            setTimeout(function () { doGeneratePDF(); btn.textContent = "Consultation PDF"; btn.disabled = false; }, 300);
+            generatePDF(oppId).then(function() {
+                btn.textContent = "Consultation PDF"; btn.disabled = false;
+            }).catch(function() {
+                btn.textContent = "Consultation PDF"; btn.disabled = false;
+            });
         });
         titleEl.appendChild(btn);
     }
 
-    function doGeneratePDF() {
-        if (!pdfLibLoaded || !window.PDFLib) { alert("PDF library still loading. Please wait and try again."); return; }
-        try {
-            var data = scrapeFields();
-            console.log("Frye Consult: Scraped data", data);
-            showEditForm(data);
-        } catch (err) { console.error("Frye Consult: PDF error:", err); }
-    }
-
-    function generateFromData(data) {
-        fetchTemplate().then(function(templateBytes) { fillTemplate(data, templateBytes); })
-        .catch(function(err) { console.error("Frye Consult: Template fetch error:", err); alert("Could not load PDF template. Check console."); });
-    }
-
-    function showEditForm(data) {
-        var ex = document.querySelector(".frye-edit-form-container"); if (ex) ex.remove();
-
-        var overlay = document.createElement("div");
-        overlay.className = "frye-edit-form-container";
-        overlay.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;";
-
-        var panel = document.createElement("div");
-        panel.style.cssText = "background:white;border-radius:8px;width:90%;max-width:820px;height:90vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.3);";
-
-        // Header
-        var header = document.createElement("div");
-        header.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid #e5e7eb;flex-shrink:0;";
-        var title = document.createElement("span");
-        title.textContent = "Edit Consultation - " + (data.pncName || "New");
-        title.style.cssText = "font-weight:600;font-size:15px;color:#1D2567;";
-        var headerBtns = document.createElement("div");
-        headerBtns.style.cssText = "display:flex;gap:8px;align-items:center;";
-        var genBtn = document.createElement("button");
-        genBtn.textContent = "Generate PDF";
-        genBtn.style.cssText = "background:#1D2567;color:white;border:none;border-radius:5px;padding:8px 18px;cursor:pointer;font-size:13px;font-weight:600;";
-        var closeBtn = document.createElement("button");
-        closeBtn.textContent = "\u00D7";
-        closeBtn.style.cssText = "background:none;border:none;font-size:22px;cursor:pointer;color:#6b7280;padding:0 4px;";
-        closeBtn.onclick = function() { overlay.remove(); };
-        headerBtns.appendChild(genBtn);
-        headerBtns.appendChild(closeBtn);
-        header.appendChild(title);
-        header.appendChild(headerBtns);
-
-        // Scrollable form body
-        var body = document.createElement("div");
-        body.style.cssText = "flex:1;overflow-y:auto;padding:16px 20px;";
-
-        var inputStyle = "width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;box-sizing:border-box;font-family:inherit;";
-        var labelStyle = "display:block;font-size:11px;font-weight:600;color:#374151;margin-bottom:3px;text-transform:uppercase;letter-spacing:0.3px;";
-        var fieldStyle = "margin-bottom:10px;";
-        var rowStyle = "display:flex;gap:12px;";
-
-        var fields = {};
-
-        function makeInput(key, label, val, type) {
-            var wrap = document.createElement("div");
-            wrap.style.cssText = fieldStyle + "flex:1;min-width:0;";
-            var lbl = document.createElement("label");
-            lbl.textContent = label;
-            lbl.style.cssText = labelStyle;
-            var inp;
-            if (type === "textarea") {
-                inp = document.createElement("textarea");
-                inp.rows = 3;
-                inp.style.cssText = inputStyle + "resize:vertical;";
-            } else if (type === "select") {
-                inp = document.createElement("select");
-                inp.style.cssText = inputStyle;
-            } else {
-                inp = document.createElement("input");
-                inp.type = "text";
-                inp.style.cssText = inputStyle;
-            }
-            inp.value = val || "";
-            fields[key] = inp;
-            wrap.appendChild(lbl);
-            wrap.appendChild(inp);
-            return wrap;
-        }
-
-        function makeSelect(key, label, options, val) {
-            var wrap = makeInput(key, label, "", "select");
-            var sel = fields[key];
-            var optEmpty = document.createElement("option");
-            optEmpty.value = ""; optEmpty.textContent = "-- Select --";
-            sel.appendChild(optEmpty);
-            for (var i = 0; i < options.length; i++) {
-                var o = document.createElement("option");
-                o.value = options[i]; o.textContent = options[i];
-                if (val && val.toLowerCase().indexOf(options[i].toLowerCase()) > -1) o.selected = true;
-                sel.appendChild(o);
-            }
-            return wrap;
-        }
-
-        function makeRow(items) {
-            var row = document.createElement("div");
-            row.style.cssText = rowStyle;
-            for (var i = 0; i < items.length; i++) row.appendChild(items[i]);
-            return row;
-        }
-
-        function makeSection(title) {
-            var s = document.createElement("div");
-            s.style.cssText = "font-size:13px;font-weight:700;color:#1D2567;border-bottom:2px solid #1D2567;padding-bottom:4px;margin:16px 0 10px 0;";
-            if (body.children.length === 0) s.style.marginTop = "0";
-            s.textContent = title;
-            return s;
-        }
-
-        // === SECTION: Consultation Status ===
-        body.appendChild(makeSection("Consultation Status"));
-        body.appendChild(makeRow([
-            makeSelect("consultStatus", "Consult Status", ["Completed","Cancelled","No Show"], data.consultStatus),
-            makeSelect("consultType", "Consult Type", ["In Person","Zoom","Phone"], data.consultType),
-            makeSelect("matterQualified", "Matter Qualified", ["Yes","No"], data.matterQualified)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("date", "Date", data.date),
-            makeInput("time", "Time", data.time),
-            makeInput("intaker", "Intaker", data.intaker),
-            makeInput("scheduledBy", "Scheduled By", data.scheduledBy)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("reasonNotQualified", "Reason Not Qualified", data.reasonNotQualified),
-            makeInput("staff", "Staff", data.staff)
-        ]));
-
-        // === SECTION: PNC Info ===
-        body.appendChild(makeSection("PNC Information"));
-        body.appendChild(makeRow([
-            makeInput("pncName", "PNC Name", data.pncName),
-            makeInput("dob", "Date of Birth", data.dob)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("phone", "Phone", data.phone),
-            makeInput("email", "Email", data.email)
-        ]));
-        body.appendChild(makeInput("mailingAddress", "Mailing Address", data.mailingAddress));
-        body.appendChild(makeRow([
-            makeInput("militaryStatus", "Military Status", data.militaryStatus),
-            makeInput("legalStatus", "Legal Status", data.legalStatus)
-        ]));
-
-        // === SECTION: Case Info ===
-        body.appendChild(makeSection("Case Information"));
-        body.appendChild(makeInput("charges", "Charges", data.charges));
-        body.appendChild(makeRow([
-            makeInput("doi", "Date of Incident", data.doi),
-            makeInput("doa", "Date of Arrest", data.doa),
-            makeInput("court", "Court", data.court),
-            makeInput("county", "County", data.county)
-        ]));
-        body.appendChild(makeInput("incidentNotes", "Incident Notes", data.incidentNotes, "textarea"));
-        body.appendChild(makeInput("involvedParties", "Involved Parties", data.involvedParties, "textarea"));
-        body.appendChild(makeInput("priors", "Priors", data.priors, "textarea"));
-        body.appendChild(makeInput("employer", "Employer/Employment", data.employer));
-        body.appendChild(makeInput("employmentImpact", "Employment Impact", data.employmentImpact, "textarea"));
-        body.appendChild(makeInput("medicalDiagnosis", "Medical Diagnosis/Meds", data.medicalDiagnosis, "textarea"));
-
-        // === SECTION: Attorney Notes ===
-        body.appendChild(makeSection("Attorney Notes & Outcomes"));
-        body.appendChild(makeInput("attorneyNotes", "Attorney Notes", data.attorneyNotes, "textarea"));
-        body.appendChild(makeRow([
-            makeInput("desiredOutcome", "Desired Outcome", data.desiredOutcome, "textarea"),
-            makeInput("biggestConcerns", "Biggest Concerns", data.biggestConcerns, "textarea")
-        ]));
-        body.appendChild(makeRow([
-            makeInput("todoIfRetained", "To Do if Retained", data.todoIfRetained, "textarea"),
-            makeInput("assignTo", "Assign To", data.assignTo, "textarea")
-        ]));
-
-        // === SECTION: Emergency Contact ===
-        body.appendChild(makeSection("Emergency Contact"));
-        body.appendChild(makeRow([
-            makeInput("emergencyContact", "Emergency Contact", data.emergencyContact),
-            makeInput("relationshipToPNC", "Relationship to PNC", data.relationshipToPNC)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("emergencyPhone", "Phone", data.emergencyPhone),
-            makeInput("emergencyEmail", "Email", data.emergencyEmail)
-        ]));
-
-        // === SECTION: Payment ===
-        body.appendChild(makeSection("Payment & Fees"));
-        body.appendChild(makeRow([
-            makeInput("retainerOnly", "Retainer Only", data.retainerOnly),
-            makeInput("retainerPlusTrial", "Retainer + Trial", data.retainerPlusTrial)
-        ]));
-        body.appendChild(makeRow([
-            makeSelect("singlePaymentRetainer", "Single Payment Retainer", ["Yes","No"], data.singlePaymentRetainer),
-            makeSelect("paymentPlan", "Payment Plan", ["Yes","No"], data.paymentPlan)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("noRetainerReferTo", "No Retainer; Refer To", data.noRetainerReferTo),
-            makeInput("other", "Other", data.other)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("dueAtSigning", "Due at Signing", data.dueAtSigning),
-            makeInput("numInstallments", "# of Installments", data.numInstallments),
-            makeSelect("dueDate", "Due Date", ["10","20"], data.dueDate)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("startDate", "Start Date", data.startDate),
-            makeInput("cashDiscount", "Cash Discount", data.cashDiscount),
-            makeInput("cashDiscountPaidBy", "Paid By", data.cashDiscountPaidBy)
-        ]));
-
-        // === SECTION: Discounts ===
-        body.appendChild(makeSection("Courtesy & Calendar"));
-        body.appendChild(makeRow([
-            makeInput("courtesyDiscount", "Courtesy Discount", data.courtesyDiscount),
-            makeInput("courtesyNotes", "Courtesy Discount Notes", data.courtesyNotes)
-        ]));
-        body.appendChild(makeRow([
-            makeInput("calendarFeePaid", "Calendar Fee Paid", data.calendarFeePaid),
-            makeInput("reasonWaived", "Reason Waived", data.reasonWaived)
-        ]));
-
-        // Generate button handler
-        genBtn.addEventListener("click", function() {
-            var formData = {};
-            for (var key in fields) {
-                if (fields.hasOwnProperty(key)) {
-                    formData[key] = fields[key].value.trim();
-                }
-            }
-            console.log("Frye Consult: Form data", formData);
-            overlay.remove();
-            generateFromData(formData);
-        });
-
-        panel.appendChild(header);
-        panel.appendChild(body);
-        overlay.appendChild(panel);
-        overlay.addEventListener("click", function(e) { if (e.target === overlay) overlay.remove(); });
-        document.body.appendChild(overlay);
-    }
-
+    // ── PDF fill + preview ──
     function fillTemplate(data, templateBytes) {
         var PDFLib = window.PDFLib;
         PDFLib.PDFDocument.load(templateBytes).then(function(pdfDoc) {
@@ -373,43 +365,45 @@
             }
 
             // PAGE 1
-            chk(p1, m(data.consultStatus,"Completed"), 67, 148); chk(p1, m(data.consultStatus,"Cancelled"), 67, 168); chk(p1, m(data.consultStatus,"No Show"), 67, 188);
-            chk(p1, m(data.consultType,"In Person"), 193, 148); chk(p1, m(data.consultType,"Zoom"), 193, 168); chk(p1, m(data.consultType,"Phone"), 193, 188);
-            chk(p1, m(data.matterQualified,"Yes"), 323, 148); chk(p1, m(data.matterQualified,"No"), 323, 168);
-            txt(p1, data.date, 453, 128); txt(p1, data.time, 453, 148); txt(p1, data.intaker, 468, 168); txt(p1, data.scheduledBy, 480, 188);
-            txt(p1, data.reasonNotQualified, 165, 210); txt(p1, data.staff, 460, 210);
-            txt(p1, data.pncName, 120, 240); txt(p1, data.dob, 440, 240);
-            txt(p1, data.phone, 95, 263); txt(p1, data.email, 340, 263);
-            txt(p1, data.mailingAddress, 135, 283);
-            txt(p1, data.militaryStatus, 140, 303); txt(p1, data.legalStatus, 393, 303);
-            txt(p1, data.charges, 120, 323, szSm);
-            txt(p1, data.doi, 82, 343); txt(p1, data.doa, 210, 343); txt(p1, data.court, 320, 343); txt(p1, data.county, 440, 343);
-            var nl = wrap(data.incidentNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<12;i++) txt(p1, nl[i], 72, 385+(i*12), szSm);
-            nl = wrap(data.involvedParties, font, szSm, 480); for (var i=0;i<nl.length&&i<2;i++) txt(p1, nl[i], 72, 548+(i*12), szSm);
-            nl = wrap(data.priors, font, szSm, 480); for (var i=0;i<nl.length&&i<2;i++) txt(p1, nl[i], 72, 598+(i*12), szSm);
-            txt(p1, data.employer, 190, 640);
-            nl = wrap(data.employmentImpact, font, szSm, 480); for (var i=0;i<nl.length&&i<2;i++) txt(p1, nl[i], 72, 678+(i*12), szSm);
-            nl = wrap(data.medicalDiagnosis, font, szSm, 480); for (var i=0;i<nl.length&&i<2;i++) txt(p1, nl[i], 72, 740+(i*12), szSm);
+            chk(p1, m(data.consultStatus,"Completed"), 72, 113); chk(p1, m(data.consultStatus,"Cancelled"), 72, 126); chk(p1, m(data.consultStatus,"No Show"), 72, 139);
+            chk(p1, m(data.consultType,"In Person"), 180, 113); chk(p1, m(data.consultType,"Zoom"), 180, 126); chk(p1, m(data.consultType,"Phone"), 180, 139);
+            chk(p1, m(data.matterQualified,"Yes"), 288, 113); chk(p1, m(data.matterQualified,"No"), 288, 126);
+            txt(p1, data.date, 426, 100); txt(p1, data.time, 428, 113); txt(p1, data.intaker, 438, 126); txt(p1, data.scheduledBy, 438, 139);
+            txt(p1, data.reasonNotQualified, 186, 158); txt(p1, data.staff, 427, 158);
+            txt(p1, data.pncName, 134, 179); txt(p1, data.dob, 360, 179);
+            txt(p1, data.phone, 110, 208); txt(p1, data.email, 342, 208);
+            txt(p1, data.mailingAddress, 156, 223);
+            txt(p1, data.militaryStatus, 147, 237); txt(p1, data.legalStatus, 376, 237);
+            txt(p1, data.charges, 118, 252, szSm);
+            txt(p1, data.doi, 95, 266); txt(p1, data.doa, 185, 266); txt(p1, data.court, 300, 266); txt(p1, data.county, 411, 266);
+            var nl = wrap(data.incidentNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<14;i++) txt(p1, nl[i], 74, 295+(i*12), szSm);
+            nl = wrap(data.involvedParties, font, szSm, 480); for (var i=0;i<nl.length&&i<3;i++) txt(p1, nl[i], 74, 495+(i*12), szSm);
+            nl = wrap(data.priors, font, szSm, 480); for (var i=0;i<nl.length&&i<3;i++) txt(p1, nl[i], 74, 556+(i*12), szSm);
+            txt(p1, data.employer, 202, 612);
+            nl = wrap(data.employmentImpact, font, szSm, 480); for (var i=0;i<nl.length&&i<4;i++) txt(p1, nl[i], 74, 638+(i*12), szSm);
+            nl = wrap(data.medicalDiagnosis, font, szSm, 480); for (var i=0;i<nl.length&&i<5;i++) txt(p1, nl[i], 74, 711+(i*12), szSm);
 
             // PAGE 2
-            nl = wrap(data.attorneyNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<14;i++) txt(p2, nl[i], 72, 115+(i*13), szSm);
-            nl = wrap(data.desiredOutcome, font, szSm, 220); for (var i=0;i<nl.length&&i<5;i++) txt(p2, nl[i], 72, 350+(i*12), szSm);
-            nl = wrap(data.biggestConcerns, font, szSm, 220); for (var i=0;i<nl.length&&i<5;i++) txt(p2, nl[i], 330, 350+(i*12), szSm);
-            nl = wrap(data.todoIfRetained, font, szSm, 220); for (var i=0;i<nl.length&&i<4;i++) txt(p2, nl[i], 72, 455+(i*12), szSm);
-            nl = wrap(data.assignTo, font, szSm, 220); for (var i=0;i<nl.length&&i<4;i++) txt(p2, nl[i], 330, 455+(i*12), szSm);
-            txt(p2, data.emergencyContact, 175, 530); txt(p2, data.relationshipToPNC, 430, 530);
-            txt(p2, data.emergencyPhone, 105, 550); txt(p2, data.emergencyEmail, 295, 550);
-            txt(p2, data.retainerOnly, 175, 590); txt(p2, data.retainerPlusTrial, 380, 590);
-            chk(p2, m(data.singlePaymentRetainer,"Yes")||m(data.singlePaymentRetainer,"Single"), 67, 615);
-            chk(p2, m(data.paymentPlan,"Yes")||m(data.paymentPlan,"Payment"), 67, 638);
-            txt(p2, data.noRetainerReferTo, 410, 615); txt(p2, data.other, 255, 638);
-            txt(p2, data.dueAtSigning, 140, 660); txt(p2, data.numInstallments, 320, 660);
-            chk(p2, m(data.dueDate,"10"), 430, 660); chk(p2, m(data.dueDate,"20"), 490, 660);
-            txt(p2, data.startDate, 120, 682); txt(p2, data.cashDiscount, 310, 682); txt(p2, data.cashDiscountPaidBy, 450, 682);
+            nl = wrap(data.attorneyNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<14;i++) txt(p2, nl[i], 74, 148+(i*13), szSm);
+            nl = wrap(data.desiredOutcome, font, szSm, 220); for (var i=0;i<nl.length&&i<5;i++) txt(p2, nl[i], 74, 363+(i*12), szSm);
+            nl = wrap(data.biggestConcerns, font, szSm, 220); for (var i=0;i<nl.length&&i<5;i++) txt(p2, nl[i], 310, 363+(i*12), szSm);
+            nl = wrap(data.todoIfRetained, font, szSm, 220); for (var i=0;i<nl.length&&i<4;i++) txt(p2, nl[i], 74, 492+(i*12), szSm);
+            nl = wrap(data.assignTo, font, szSm, 220); for (var i=0;i<nl.length&&i<4;i++) txt(p2, nl[i], 313, 492+(i*12), szSm);
+            txt(p2, data.emergencyContact, 185, 592); txt(p2, data.relationshipToPNC, 434, 592);
+            txt(p2, data.emergencyPhone, 112, 611); txt(p2, data.emergencyEmail, 285, 611);
+            chk(p2, !!data.retainerOnly, 72, 653); txt(p2, data.retainerOnly, 178, 653);
+            chk(p2, !!data.retainerPlusTrial, 251, 653); txt(p2, data.retainerPlusTrial, 365, 653);
+            chk(p2, m(data.singlePaymentRetainer,"Yes")||m(data.singlePaymentRetainer,"Single"), 72, 673);
+            txt(p2, data.noRetainerReferTo, 413, 673);
+            chk(p2, m(data.paymentPlan,"Yes")||m(data.paymentPlan,"Payment"), 72, 693);
+            txt(p2, data.other, 235, 693);
+            txt(p2, data.dueAtSigning, 169, 712); txt(p2, data.numInstallments, 330, 712);
+            chk(p2, m(data.dueDate,"10"), 440, 712); chk(p2, m(data.dueDate,"20"), 477, 712);
+            txt(p2, data.startDate, 133, 732); txt(p2, data.cashDiscount, 310, 732); txt(p2, data.cashDiscountPaidBy, 412, 732);
 
             // PAGE 3
-            txt(p3, data.courtesyDiscount, 175, 115); txt(p3, data.courtesyNotes, 320, 115);
-            txt(p3, data.calendarFeePaid, 155, 137); txt(p3, data.reasonWaived, 375, 137);
+            txt(p3, data.courtesyDiscount, 181, 101); txt(p3, data.courtesyNotes, 292, 101);
+            txt(p3, data.calendarFeePaid, 178, 120); txt(p3, data.reasonWaived, 295, 120);
 
             return pdfDoc.save();
         }).then(function(filledBytes) {
@@ -427,7 +421,7 @@
         var h = document.createElement("div"); h.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #e5e7eb;";
         var t = document.createElement("span"); t.textContent = "Consultation - " + (data.pncName || "Preview"); t.style.cssText = "font-weight:600;font-size:14px;";
         var bg = document.createElement("div"); bg.style.cssText = "display:flex;gap:8px;";
-        var db = document.createElement("button"); db.textContent = "Download PDF"; db.style.cssText = "background:#1D2567;color:white;border:none;border-radius:5px;padding:6px 14px;cursor:pointer;font-size:13px;";
+        var db = document.createElement("button"); db.textContent = "Download PDF"; db.style.cssText = "background:#165def;color:white;border:none;border-radius:5px;padding:6px 14px;cursor:pointer;font-size:13px;";
         db.onclick = function() { var a = document.createElement("a"); a.href = url; a.download = "Consultation_" + (data.pncName||"Form").replace(/\s+/g,"_") + ".pdf"; a.click(); };
         var cb = document.createElement("button"); cb.textContent = "\u00D7"; cb.style.cssText = "background:none;border:none;font-size:22px;cursor:pointer;color:#6b7280;padding:0 4px;";
         cb.onclick = function() { URL.revokeObjectURL(url); c.remove(); };
@@ -436,42 +430,6 @@
         p.appendChild(h); p.appendChild(ifr); c.appendChild(p);
         c.addEventListener("click", function(e) { if (e.target === c) { URL.revokeObjectURL(url); c.remove(); } });
         document.body.appendChild(c);
-    }
-
-    function getOpportunityName() { var el = document.querySelector(".ui-modal-heading .title"); if (!el) return ""; var cl = el.cloneNode(true); cl.querySelectorAll("button").forEach(function(b){b.remove();}); return cl.textContent.trim(); }
-    function getFieldByLabel(label) { var items = document.querySelectorAll(".hr-form-item"); for (var i=0;i<items.length;i++) { var it = items[i]; var le = it.querySelector(".hr-form-item-label__text, .n-form-item-label__text"); if (!le || le.textContent.trim() !== label) continue; var dd = it.querySelector(".hr-base-selection-input__content, .n-base-selection-input__content"); if (dd) { var v = dd.textContent.trim(); if (v && v.indexOf("Select")===-1 && v.indexOf("Choose")===-1) return v; } var inp = it.querySelector("input[type='text'], input:not([type='radio']):not([type='checkbox'])"); if (inp && inp.value) return inp.value.trim(); var ta = it.querySelector("textarea"); if (ta && ta.value) return ta.value.trim(); var cr = it.querySelector("input[type='radio']:checked"); if (cr) return cr.value; var ck = it.querySelector("[role='checkbox']"); if (ck) return ck.getAttribute("aria-checked")==="true"?"Yes":"No"; var di = it.querySelector(".n-input__input-el, .hr-input__input-el"); if (di && di.value) return di.value.trim(); var at = it.textContent.replace(label,"").trim(); if (at && at.length < 200) return at; return ""; } return ""; }
-    function getRadioByLabel(label) { var items = document.querySelectorAll(".hr-form-item"); for (var i=0;i<items.length;i++) { var it = items[i]; var le = it.querySelector(".hr-form-item-label__text, .n-form-item-label__text"); if (!le || le.textContent.trim() !== label) continue; var ch = it.querySelector("input[type='radio']:checked"); return ch ? ch.value : ""; } return ""; }
-
-    function scrapeFields() {
-        var d = {}; d.charges = getOpportunityName();
-        d.consultStatus = getFieldByLabel("Consult Status") || getRadioByLabel("Consult Status"); d.consultType = getFieldByLabel("Consult Type") || getRadioByLabel("Consult Type");
-        d.matterQualified = getFieldByLabel("Matter Qualified") || getRadioByLabel("Matter Qualified"); d.date = getFieldByLabel("Date") || getFieldByLabel("Consult Date");
-        d.time = getFieldByLabel("Time") || getFieldByLabel("Consult Time"); d.intaker = getFieldByLabel("Intaker");
-        d.scheduledBy = getFieldByLabel("Scheduled by") || getFieldByLabel("Scheduled By"); d.reasonNotQualified = getFieldByLabel("Reason not qualified") || getFieldByLabel("Reason Not Qualified");
-        d.staff = getFieldByLabel("Staff"); d.pncFirstName = getFieldByLabel("PNC First Name") || getFieldByLabel("First Name") || "";
-        d.pncLastName = getFieldByLabel("PNC Last Name") || getFieldByLabel("Last Name") || "";
-        d.pncName = d.pncFirstName && d.pncLastName ? d.pncFirstName + " " + d.pncLastName : getFieldByLabel("PNC Name") || getFieldByLabel("Contact Name") || "";
-        d.dob = getFieldByLabel("DOB") || getFieldByLabel("Date of Birth") || ""; d.phone = getFieldByLabel("Phone") || getFieldByLabel("PNC Phone") || "";
-        d.email = getFieldByLabel("Email") || getFieldByLabel("PNC Email") || ""; d.mailingAddress = getFieldByLabel("Mailing Address") || getFieldByLabel("Address") || "";
-        d.militaryStatus = getFieldByLabel("Military Status") || ""; d.legalStatus = getFieldByLabel("Legal Status") || "";
-        d.doi = getFieldByLabel("DoI") || getFieldByLabel("Date of Incident") || ""; d.doa = getFieldByLabel("DoA") || getFieldByLabel("Date of Arrest") || "";
-        d.court = getFieldByLabel("Court") || ""; d.county = getFieldByLabel("County") || "";
-        d.incidentNotes = getFieldByLabel("Incident Notes") || getFieldByLabel("Other Notes") || ""; d.involvedParties = getFieldByLabel("Involved Parties") || "";
-        d.priors = getFieldByLabel("Priors") || getFieldByLabel("Prior charges/arrests") || ""; d.employer = getFieldByLabel("Employer/Employment") || getFieldByLabel("Employer") || "";
-        d.employmentImpact = getFieldByLabel("Employment Impact") || ""; d.medicalDiagnosis = getFieldByLabel("Medical Diagnosis/Meds") || getFieldByLabel("Medical Diagnosis") || "";
-        d.attorneyNotes = getFieldByLabel("Attorney Notes") || ""; d.desiredOutcome = getFieldByLabel("Desired Outcome") || "";
-        d.biggestConcerns = getFieldByLabel("Biggest Concerns") || ""; d.todoIfRetained = getFieldByLabel("To Do if Retained") || getFieldByLabel("To Do If Retained") || "";
-        d.assignTo = getFieldByLabel("Assign To") || getFieldByLabel("Assigned To") || ""; d.emergencyContact = getFieldByLabel("Emergency Contact") || "";
-        d.relationshipToPNC = getFieldByLabel("Relationship to PNC") || getFieldByLabel("Relationship To PNC") || ""; d.emergencyPhone = getFieldByLabel("Emergency Contact Phone") || "";
-        d.emergencyEmail = getFieldByLabel("Emergency Contact Email") || ""; d.retainerOnly = getFieldByLabel("Retainer Only") || "";
-        d.retainerPlusTrial = getFieldByLabel("Retainer + Trial") || ""; d.singlePaymentRetainer = getRadioByLabel("Single Payment Retainer") || getFieldByLabel("Single Payment Retainer") || "";
-        d.paymentPlan = getRadioByLabel("Payment Plan") || getFieldByLabel("Payment Plan") || ""; d.noRetainerReferTo = getFieldByLabel("No Retainer; Reject or Refer to") || getFieldByLabel("Reject or Refer to") || "";
-        d.other = getFieldByLabel("Other") || ""; d.dueAtSigning = getFieldByLabel("Due at Signing") || getFieldByLabel("Due At Signing") || "";
-        d.numInstallments = getFieldByLabel("Number of Installments") || getFieldByLabel("# of Installments") || ""; d.dueDate = getFieldByLabel("Due Date") || getFieldByLabel("Installment Due Day") || "";
-        d.startDate = getFieldByLabel("Start Date") || getFieldByLabel("Installment Start Month") || ""; d.cashDiscount = getFieldByLabel("Cash Discount") || "";
-        d.cashDiscountPaidBy = getFieldByLabel("Cash Discount Paid By") || getFieldByLabel("if paid by") || ""; d.courtesyDiscount = getFieldByLabel("Courtesy Discount") || "";
-        d.courtesyNotes = getFieldByLabel("Courtesy Discount Notes") || ""; d.calendarFeePaid = getFieldByLabel("Calendar Fee Paid") || "";
-        d.reasonWaived = getFieldByLabel("Reason Waived") || ""; return d;
     }
 
 })();
