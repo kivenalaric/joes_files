@@ -202,8 +202,8 @@
         d.scheduledBy = "";
         d.staff = "";
         d.legalStatus = "";
-        d.calendarFeePaid = cf("calendar fee paid");
-        d.reasonWaived = cf("reason waived");
+        d.calendarFeePaid = "";
+        d.reasonWaived = "";
 
         d.consultStatus = cf("consult status/type", "consult status");
         d.consultType = cf("consult status/type", "consult type");
@@ -380,44 +380,12 @@
 
             function txt(page, text, x, yTop, size, f) { if (!text) return; page.drawText(String(text), {x:x, y:H-yTop, size:size||sz, font:f||font, color:color}); }
             function chk(page, checked, x, yTop) { if (checked) txt(page, "X", x+1, yTop, 10, fontBold); }
-            function m(v, t) { return v != null && String(v).toLowerCase().indexOf(String(t).toLowerCase()) > -1; }
+            function m(v, t) { return v && v.toLowerCase().indexOf(t.toLowerCase()) > -1; }
             function wrap(text, f, s, mw) {
                 if (!text) return [];
                 var words = text.split(" "), lines = [], cur = "";
                 for (var i = 0; i < words.length; i++) { var t = cur ? cur + " " + words[i] : words[i]; if (f.widthOfTextAtSize(t, s) > mw && cur) { lines.push(cur); cur = words[i]; } else { cur = t; } }
                 if (cur) lines.push(cur); return lines;
-            }
-            // Single-line auto-shrink: reduces size until text fits maxWidth (min 5)
-            function txtFit(page, text, x, yTop, maxWidth, baseSize, f) {
-                if (!text) return;
-                var fnt = f || font, size = baseSize || sz;
-                while (size > 5 && fnt.widthOfTextAtSize(String(text), size) > maxWidth) size -= 0.5;
-                txt(page, text, x, yTop, size, fnt);
-            }
-            // Multi-line auto-shrink: tries baseSize; if wrap exceeds maxLines, shrinks size & line-height
-            // until it fits or hits minSize. Truncates last line with ellipsis if still over.
-            function wrapFit(page, text, x, yTop, mw, maxLines, baseSize, baseLh, f) {
-                if (!text) return;
-                var fnt = f || font, size = baseSize || szSm, lh = baseLh || 12;
-                var totalH = maxLines * lh, minSize = 5;
-                var lines = wrap(text, fnt, size, mw);
-                while (lines.length > maxLines && size > minSize) {
-                    size -= 0.5;
-                    lh = Math.max(size + 1, totalH / Math.ceil(lines.length));
-                    if (lh * lines.length > totalH) lh = totalH / lines.length;
-                    lines = wrap(text, fnt, size, mw);
-                }
-                if (lines.length > maxLines) {
-                    lh = totalH / lines.length;
-                    if (lh < size) { // ensure no overlap; truncate instead
-                        lines = lines.slice(0, maxLines);
-                        var last = lines[maxLines - 1];
-                        while (last.length > 1 && fnt.widthOfTextAtSize(last + "…", size) > mw) last = last.slice(0, -1);
-                        lines[maxLines - 1] = last + "…";
-                        lh = totalH / maxLines;
-                    }
-                }
-                for (var i = 0; i < lines.length; i++) txt(page, lines[i], x, yTop + (i * lh), size, fnt);
             }
 
             // PAGE 1 — new_virgin_file.pdf (2-page layout)
@@ -438,32 +406,30 @@
             txt(p1, data.militaryStatus, 147, 237); txt(p1, data.legalStatus, 376, 237);
             // Charges (below label, full-width)
             txt(p1, data.charges, 118, 252, szSm);
-            // DoI / DoA / Court / County (auto-shrink to avoid overflow into next column)
-            txt(p1, data.doi, 95, 266); txt(p1, data.doa, 185, 266);
-            txtFit(p1, data.court, 300, 266, 80, sz);
-            txtFit(p1, data.county, 411, 266, 90, sz);
-            // Incident Notes (~6 lines) — yTop is first-line baseline, pushed inside box
-            wrapFit(p1, data.incidentNotes, 76, 305, 460, 6, szSm, 12);
-            // Involved Parties (~3 lines)
-            wrapFit(p1, data.involvedParties, 76, 402, 460, 3, szSm, 12);
-            // Priors (~3 lines)
-            wrapFit(p1, data.priors, 76, 463, 460, 3, szSm, 12);
-            // Employer/Employment (inline)
-            txtFit(p1, data.employer, 202, 507, 340, sz);
-            // Employment Impact (~4 lines)
-            wrapFit(p1, data.employmentImpact, 76, 545, 460, 4, szSm, 12);
-            // Medical Diagnosis (~3 lines)
-            wrapFit(p1, data.medicalDiagnosis, 76, 618, 460, 3, szSm, 12);
-            // Attorney Notes (~8 lines)
-            wrapFit(p1, data.attorneyNotes, 76, 677, 460, 8, szSm, 12);
+            // DoI / DoA / Court / County
+            txt(p1, data.doi, 95, 266); txt(p1, data.doa, 185, 266); txt(p1, data.court, 300, 266); txt(p1, data.county, 411, 266);
+            // Incident Notes (label y=277, box y=295 → 368, ~6 lines at 12pt)
+            var nl = wrap(data.incidentNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<6;i++) txt(p1, nl[i], 74, 295+(i*12), szSm);
+            // Involved Parties (label y=374, box y=391 → 429, ~3 lines)
+            nl = wrap(data.involvedParties, font, szSm, 480); for (var i=0;i<nl.length&&i<3;i++) txt(p1, nl[i], 74, 391+(i*12), szSm);
+            // Priors (label y=435, box y=452 → 490, ~3 lines)
+            nl = wrap(data.priors, font, szSm, 480); for (var i=0;i<nl.length&&i<3;i++) txt(p1, nl[i], 74, 452+(i*12), szSm);
+            // Employer/Employment (inline, label ends ~x=200, y=497)
+            txt(p1, data.employer, 202, 507);
+            // Employment Impact (label y=517, box y=534 → 584, ~4 lines)
+            nl = wrap(data.employmentImpact, font, szSm, 480); for (var i=0;i<nl.length&&i<4;i++) txt(p1, nl[i], 74, 534+(i*12), szSm);
+            // Medical Diagnosis (label y=590, box y=607 → 643, ~3 lines)
+            nl = wrap(data.medicalDiagnosis, font, szSm, 480); for (var i=0;i<nl.length&&i<3;i++) txt(p1, nl[i], 74, 607+(i*12), szSm);
+            // Attorney Notes (label y=649, box y=666 → ~770, ~8 lines)
+            nl = wrap(data.attorneyNotes, font, szSm, 480); for (var i=0;i<nl.length&&i<8;i++) txt(p1, nl[i], 74, 666+(i*12), szSm);
 
             // PAGE 2 — new_virgin_file.pdf
-            // Desired Outcome + Biggest Concerns (~8 lines)
-            wrapFit(p2, data.desiredOutcome, 76, 177, 210, 8, szSm, 12);
-            wrapFit(p2, data.biggestConcerns, 312, 177, 210, 8, szSm, 12);
-            // To Do if Retained + Assign To (~7 lines)
-            wrapFit(p2, data.todoIfRetained, 76, 305, 210, 7, szSm, 12);
-            wrapFit(p2, data.assignTo, 315, 305, 210, 7, szSm, 12);
+            // Desired Outcome + Biggest Concerns (labels y=149, boxes y=166 → 270, ~8 lines at 12pt)
+            nl = wrap(data.desiredOutcome, font, szSm, 220); for (var i=0;i<nl.length&&i<8;i++) txt(p2, nl[i], 74, 166+(i*12), szSm);
+            nl = wrap(data.biggestConcerns, font, szSm, 220); for (var i=0;i<nl.length&&i<8;i++) txt(p2, nl[i], 310, 166+(i*12), szSm);
+            // To Do if Retained + Assign To (labels y=277, boxes y=294 → 378, ~7 lines)
+            nl = wrap(data.todoIfRetained, font, szSm, 220); for (var i=0;i<nl.length&&i<7;i++) txt(p2, nl[i], 74, 294+(i*12), szSm);
+            nl = wrap(data.assignTo, font, szSm, 220); for (var i=0;i<nl.length&&i<7;i++) txt(p2, nl[i], 313, 294+(i*12), szSm);
             // Emergency Contact + Relationship to PNC
             txt(p2, data.emergencyContact, 185, 395); txt(p2, data.relationshipToPNC, 434, 395);
             txt(p2, data.emergencyPhone, 112, 414); txt(p2, data.emergencyEmail, 285, 414);
@@ -483,12 +449,8 @@
             txt(p2, data.startDate, 133, 535); txt(p2, data.cashDiscount, 310, 535); txt(p2, data.cashDiscountPaidBy, 412, 535);
             // Courtesy Discount + Notes
             txt(p2, data.courtesyDiscount, 181, 555); txt(p2, data.courtesyNotes, 292, 555);
-            // Calendar Fee Paid — template has a text line after label, render as Yes/No
-            var cfpV = data.calendarFeePaid;
-            var cfpYes = cfpV === true || m(cfpV,"true") || m(cfpV,"yes") || m(cfpV,"paid") || m(cfpV,"1");
-            var cfpNo  = cfpV === false || m(cfpV,"false") || m(cfpV,"no") || m(cfpV,"unpaid") || m(cfpV,"waived");
-            txt(p2, cfpYes ? "Yes" : (cfpNo ? "No" : ""), 178, 575);
-            txtFit(p2, data.reasonWaived, 295, 575, 220, sz);
+            // Calendar Fee Paid + Reason Waived
+            txt(p2, data.calendarFeePaid, 178, 575); txt(p2, data.reasonWaived, 295, 575);
 
             return pdfDoc.save();
         }).then(function(filledBytes) {
